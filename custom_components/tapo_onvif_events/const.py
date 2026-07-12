@@ -45,6 +45,14 @@ RETRY_SECONDS = 5                       # backoff after a loop error
 # triggers do NOT fire on that edge).
 OFFLINE_GRACE = 30
 
+# Self-healing watchdog: a key held "on" this long with no fresh `true` from the
+# camera is treated as a stale latch and forced off. The camera floods repeated
+# `true`s while a subject is genuinely present (sub-second cadence), so a gap this
+# large means the detection really ended and its `false` was dropped/lost. Mainly
+# guards the basic CellMotion (IsMotion) detector, which can emit an `on` with no
+# matching `off`; the smart detectors clear on their own well within this window.
+STUCK_ON_TIMEOUT = 60
+
 # Dispatcher signals (per config entry)
 def signal_state(entry_id: str) -> str:
     """Signal fired when a detection key changes state."""

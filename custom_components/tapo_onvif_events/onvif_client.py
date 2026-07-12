@@ -25,6 +25,7 @@ from .const import (
     PULL_TIMEOUT,
     RENEW_SECONDS,
     RETRY_SECONDS,
+    STUCK_ON_TIMEOUT,
     SUB_LIFETIME,
     signal_availability,
     signal_state,
@@ -80,6 +81,9 @@ class TapoOnvifClient:
 
         # Baseline: every key OFF until the camera says otherwise.
         self.state: dict[str, bool] = {key: False for (_f, key, _dc, _l) in KEYS}
+        # Monotonic time we last received a `true` for each key (updated on every
+        # received `true`, including dedup'd ones) — drives the stuck-on watchdog.
+        self._last_true: dict[str, float] = {}
         self.available = False
         self._stop = asyncio.Event()
 
@@ -87,12 +91,35 @@ class TapoOnvifClient:
 
     def _set_key(self, key: str, value: bool) -> None:
         """Dedup and push a single detection key on change."""
+        if value:
+            # Refresh liveness on every received `true`, even when deduped, so the
+            # watchdog can tell "still actively detected" from "stuck / dropped off".
+            self._last_true[key] = time.monotonic()
         if self.state.get(key) != value:
             self.state[key] = value
             _LOGGER.debug("[%s] %s -> %s", self._host, key, "ON" if value else "OFF")
             async_dispatcher_send(
                 self.hass, signal_state(self.entry_id), key, value
             )
+
+    def _check_stuck(self) -> None:
+        """Force off any key held on past STUCK_ON_TIMEOUT with no fresh `true`.
+
+        Self-heals a dropped-off latch (seen on the basic CellMotion detector,
+        which occasionally emits an `on` without a matching `off`). A genuinely
+        active subject keeps the camera flooding `true`s, so `_last_true` stays
+        fresh and this never fires for it.
+        """
+        now = time.monotonic()
+        for key, is_on in list(self.state.items()):
+            if is_on and now - self._last_true.get(key, 0.0) > STUCK_ON_TIMEOUT:
+                _LOGGER.warning(
+                    "[%s] %s stuck on >%ss with no fresh event; forcing off",
+                    self._host,
+                    key,
+                    STUCK_ON_TIMEOUT,
+                )
+                self._set_key(key, False)
 
     def _set_available(self, value: bool) -> None:
         """Push availability on change."""
@@ -156,6 +183,10 @@ class TapoOnvifClient:
                     resp = await pullpoint.PullMessages(req)
                     for message in getattr(resp, "NotificationMessage", None) or []:
                         self._handle_message(message)
+                    # Runs each poll iteration (>= every long-poll timeout even
+                    # when idle), so a stuck key self-clears within ~one timeout
+                    # of STUCK_ON_TIMEOUT.
+                    self._check_stuck()
                     if time.monotonic() >= next_renew:
                         await sub_mgr.Renew(cam.get_next_termination_time(SUB_LIFETIME))
                         next_renew = time.monotonic() + RENEW_SECONDS
