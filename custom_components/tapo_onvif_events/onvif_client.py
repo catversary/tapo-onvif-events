@@ -135,6 +135,15 @@ class TapoOnvifClient:
                 # Subscription manager (Renew / Unsubscribe) + pull service.
                 sub_mgr = await cam.create_subscription_service("PullPointSubscription")
                 pullpoint = await cam.create_pullpoint_service()
+                # Re-baseline on every (re)subscribe. The camera keeps no state
+                # across a reconnect or its scheduled reboot, so any "on" we are
+                # still holding is stale. Clear it BEFORE marking available, so
+                # entities recover as unavailable -> off (a clean edge); a stale
+                # unavailable -> on would be missed by HA `to: "on"` triggers. A
+                # genuinely-active detection re-fires a clean off -> on on the
+                # camera's next event.
+                for _field, _key, _dc, _label in KEYS:
+                    self._set_key(_key, False)
                 self._set_available(True)
                 fail_since = None
                 _LOGGER.info("[%s] subscribed %s", self._host, cam.xaddrs[PP_NS])
