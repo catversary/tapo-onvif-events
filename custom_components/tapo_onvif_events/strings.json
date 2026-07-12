@@ -1,0 +1,27 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Tapo ONVIF Events",
+        "description": "Connect to a Tapo camera's ONVIF PullPoint event stream. Use the camera's ONVIF/\"Camera Account\" credentials (set in the Tapo app), not your TP-Link cloud login.",
+        "data": {
+          "host": "Host",
+          "port": "ONVIF port",
+          "username": "Username",
+          "password": "Password"
+        },
+        "data_description": {
+          "port": "Tapo cameras use 2020.",
+          "username": "The camera-account username you set in the Tapo app.",
+          "password": "The camera-account password you set in the Tapo app."
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Failed to connect. Check the host, ONVIF port (2020) and camera-account credentials."
+    },
+    "abort": {
+      "already_configured": "This camera is already configured."
+    }
+  }
+}

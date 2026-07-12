@@ -1,0 +1,12 @@
+{
+  "domain": "tapo_onvif_events",
+  "name": "Tapo ONVIF Events",
+  "codeowners": ["@catversary"],
+  "config_flow": true,
+  "documentation": "https://github.com/catversary/tapo-onvif-events",
+  "integration_type": "device",
+  "iot_class": "local_push",
+  "issue_tracker": "https://github.com/catversary/tapo-onvif-events/issues",
+  "requirements": ["onvif-zeep-async==4.2.1"],
+  "version": "0.1.0"
+}

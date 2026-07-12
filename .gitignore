@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.venv/
+
+# Local operator notes — contain private network details (IPs, camera account,
+# SSH paths) specific to the maintainer's install. NOT for publication.
+TESTING.md
