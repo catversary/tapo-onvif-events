@@ -8,5 +8,5 @@
   "iot_class": "local_push",
   "issue_tracker": "https://github.com/catversary/tapo-onvif-events/issues",
   "requirements": ["onvif-zeep-async==4.2.1"],
-  "version": "0.1.1"
+  "version": "0.1.2"
 }

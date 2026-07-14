@@ -38,6 +38,13 @@ FIELD_MAP: dict[str, str] = {field: key for (field, key, _dc, _label) in KEYS}
 SUB_LIFETIME = timedelta(seconds=600)  # requested / renewed subscription lifetime
 RENEW_SECONDS = 480                     # renew this often (< SUB_LIFETIME)
 PULL_TIMEOUT = 30                       # long-poll PullMessages timeout (seconds)
+# Hard client-side ceiling on a single PullMessages call = its requested ONVIF
+# timeout + this slack. A healthy camera always returns within PULL_TIMEOUT; some
+# Tapo firmware occasionally holds the long-poll open indefinitely (connection
+# alive, but the call never completes), which freezes the poll loop — and the
+# stuck-key watchdog riding inside it — for hours. Past this we force-abort and
+# reconnect, and the resubscribe re-baselines every key to off (clears stale latch).
+PULL_HARD_SLACK = 10
 RETRY_SECONDS = 5                       # backoff after a loop error
 
 # Only mark entities unavailable after this many seconds of sustained failure,

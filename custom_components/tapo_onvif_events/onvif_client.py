@@ -22,6 +22,7 @@ from .const import (
     KEYS,
     OFFLINE_GRACE,
     PP_NS,
+    PULL_HARD_SLACK,
     PULL_TIMEOUT,
     RENEW_SECONDS,
     RETRY_SECONDS,
@@ -84,6 +85,11 @@ class TapoOnvifClient:
         # Monotonic time we last received a `true` for each key (updated on every
         # received `true`, including dedup'd ones) — drives the stuck-on watchdog.
         self._last_true: dict[str, float] = {}
+        # Monotonic time each key last transitioned off->on — on-duration for the
+        # diagnostic line below (and the future max-on ceiling). Cleared on ->off.
+        self._on_since: dict[str, float] = {}
+        # Throttle (per key) for the per-iteration on-status diagnostic log.
+        self._diag_log: dict[str, float] = {}
         self.available = False
         self._stop = asyncio.Event()
 
@@ -97,6 +103,10 @@ class TapoOnvifClient:
             self._last_true[key] = time.monotonic()
         if self.state.get(key) != value:
             self.state[key] = value
+            if value:
+                self._on_since[key] = time.monotonic()
+            else:
+                self._on_since.pop(key, None)
             _LOGGER.debug("[%s] %s -> %s", self._host, key, "ON" if value else "OFF")
             async_dispatcher_send(
                 self.hass, signal_state(self.entry_id), key, value
@@ -112,7 +122,23 @@ class TapoOnvifClient:
         """
         now = time.monotonic()
         for key, is_on in list(self.state.items()):
-            if is_on and now - self._last_true.get(key, 0.0) > STUCK_ON_TIMEOUT:
+            if not is_on:
+                continue
+            last_true_age = now - self._last_true.get(key, 0.0)
+            # DIAG (throttled): proves this watchdog is running while a key is on,
+            # and whether `true`s keep arriving (flood: last_true ~0s) or not
+            # (stale latch: last_true aging). Absence of these lines during a
+            # known stuck-on = the pull loop is blocked (hung long-poll).
+            if now - self._diag_log.get(key, 0.0) >= 10.0:
+                self._diag_log[key] = now
+                _LOGGER.debug(
+                    "[%s] DIAG %s on %.0fs, last_true %.1fs ago (watchdog alive)",
+                    self._host,
+                    key,
+                    now - self._on_since.get(key, now),
+                    last_true_age,
+                )
+            if last_true_age > STUCK_ON_TIMEOUT:
                 _LOGGER.warning(
                     "[%s] %s stuck on >%ss with no fresh event; forcing off",
                     self._host,
@@ -137,10 +163,21 @@ class TapoOnvifClient:
         if data is None:
             return
         for simple_item in getattr(data, "SimpleItem", None) or []:
-            key = FIELD_MAP.get(simple_item.Name)
+            name = simple_item.Name
+            raw = str(simple_item.Value)
+            key = FIELD_MAP.get(name)
+            # Log every field the camera sends — including dedup'd repeats and
+            # unmapped fields — so the raw PullMessages delivery is visible.
+            _LOGGER.debug(
+                "[%s] rx %s=%s%s",
+                self._host,
+                name,
+                raw,
+                "" if key else " (unmapped)",
+            )
             if not key:
                 continue
-            value = str(simple_item.Value).lower() == "true"
+            value = raw.lower() == "true"
             self._set_key(key, value)
 
     # -- lifecycle -------------------------------------------------------
@@ -180,8 +217,39 @@ class TapoOnvifClient:
                     req = pullpoint.create_type("PullMessages")
                     req.Timeout = _pull_timeout(budget)
                     req.MessageLimit = 100
-                    resp = await pullpoint.PullMessages(req)
-                    for message in getattr(resp, "NotificationMessage", None) or []:
+                    # Force-abort a single poll that outlives the camera's own
+                    # long-poll timeout by more than PULL_HARD_SLACK. A stalled
+                    # Tapo can hold the connection open (alive, never completing)
+                    # for hours, freezing this loop and the stuck-key watchdog
+                    # with it. Aborting drops to the reconnect path below, whose
+                    # resubscribe re-baselines every key to off (clears a stale
+                    # latch within ~one retry) and restores event flow.
+                    hard_timeout = req.Timeout.total_seconds() + PULL_HARD_SLACK
+                    poll_start = time.monotonic()
+                    try:
+                        resp = await asyncio.wait_for(
+                            pullpoint.PullMessages(req), timeout=hard_timeout
+                        )
+                    except asyncio.TimeoutError as err:
+                        # Name the keys currently ON so a captured stall directly
+                        # shows the causal chain: a stall while (e.g.) person is ON
+                        # is the exact scenario that stranded the closing `false`
+                        # overnight; the resubscribe below re-baselines it off.
+                        on_keys = [k for k, is_on in self.state.items() if is_on]
+                        raise RuntimeError(
+                            f"PullMessages stalled >{hard_timeout:.0f}s "
+                            "(camera held the long-poll open; keys on: "
+                            f"{', '.join(on_keys) if on_keys else 'none'}); "
+                            "forcing reconnect"
+                        ) from err
+                    messages = getattr(resp, "NotificationMessage", None) or []
+                    _LOGGER.debug(
+                        "[%s] PullMessages returned after %.1fs with %d message(s)",
+                        self._host,
+                        time.monotonic() - poll_start,
+                        len(messages),
+                    )
+                    for message in messages:
                         self._handle_message(message)
                     # Runs each poll iteration (>= every long-poll timeout even
                     # when idle), so a stuck key self-clears within ~one timeout
@@ -216,15 +284,19 @@ class TapoOnvifClient:
         self._stop.set()
 
     async def _teardown(self, cam, sub_mgr) -> None:
-        """Best-effort clean teardown of a subscription + connection."""
+        """Best-effort clean teardown of a subscription + connection.
+
+        Guarded with short timeouts: right after a stalled poll the same wedged
+        connection would otherwise hang here too.
+        """
         if sub_mgr is not None:
             try:
-                await sub_mgr.Unsubscribe()
+                await asyncio.wait_for(sub_mgr.Unsubscribe(), timeout=5)
             except Exception:  # noqa: BLE001
                 pass
         if cam is not None:
             try:
-                await cam.close()
+                await asyncio.wait_for(cam.close(), timeout=5)
             except Exception:  # noqa: BLE001
                 pass
 
