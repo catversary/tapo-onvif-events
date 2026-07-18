@@ -14,6 +14,12 @@ CONF_PASSWORD = "password"
 
 DEFAULT_PORT = 2020  # Tapo ONVIF port
 
+# Options-flow key (per config entry). Opt-in flap recovery for a chronically
+# flaky camera (seen on some Tapo C325WB firmware, whose ONVIF server hangs up
+# the connection every few seconds in an endless reconnect loop). OFF by default
+# so a healthy camera keeps the original, unchanged code path.
+CONF_FLAP_RECOVERY = "flap_recovery"
+
 # ONVIF PullPoint subscription namespace (xaddr key for the pull service)
 PP_NS = "http://www.onvif.org/ver10/events/wsdl/PullPointSubscription"
 
@@ -59,6 +65,36 @@ OFFLINE_GRACE = 30
 # guards the basic CellMotion (IsMotion) detector, which can emit an `on` with no
 # matching `off`; the smart detectors clear on their own well within this window.
 STUCK_ON_TIMEOUT = 60
+
+# --- Flap recovery (only active when CONF_FLAP_RECOVERY is enabled) ----------
+# A flaky camera can accept then drop the ONVIF connection every few seconds
+# (ServerDisconnectedError) in a tight reconnect-fail loop that never holds a
+# subscription long enough to pull queued events — so detections are silently
+# lost while every entity still reads a healthy "off". These tunables let an
+# opted-in entry (a) retry the pull on the same subscription instead of tearing
+# it down (the teardown discards the camera's queued events) and de-flood the
+# log, and (b) go honestly "unavailable" while the feed is down, so automations
+# and reports can tell the event feed is degraded.
+FLAP_THRESHOLD = 3        # consecutive disconnects before we treat it as a flap
+# Pause before re-subscribing when the in-loop retry escalates (subscription
+# refresh). Small — we want to resume rapid pulling on a fresh subscription
+# quickly — but non-zero so we never hammer CreatePullPointSubscription (heavier
+# than a pull, and the camera has a low subscription cap). This is a rare path:
+# the escalation only fires after FLAP_OFFLINE_GRACE with zero successful pulls.
+FLAP_RESUB_DELAY = 1.0
+# Spacing between same-subscription pull retries during a flap. A dropped pull
+# connection does NOT invalidate the PullPoint subscription (proven by live
+# probe: one held subscription kept delivering queued events across a ~60% drop
+# rate), so we retry the pull on the SAME subscription at this cadence instead of
+# tearing down + resubscribing (the teardown is what loses the queued events).
+# ~0.25s ≈ 4 attempts/s — enough to catch the ~40% of connections that survive
+# within ~1-2s, without busy-spinning.
+FLAP_PULL_RETRY_DELAY = 0.25
+# No successful PullMessages for this long (while flapping) => mark unavailable.
+# Must exceed one idle long-poll (PULL_TIMEOUT) so a quiet healthy camera — which
+# still completes an empty PullMessages every long-poll — never trips it.
+FLAP_OFFLINE_GRACE = 120
+FLAP_HEARTBEAT = 300      # while flapping, emit one summary WARNING this often
 
 # Dispatcher signals (per config entry)
 def signal_state(entry_id: str) -> str:

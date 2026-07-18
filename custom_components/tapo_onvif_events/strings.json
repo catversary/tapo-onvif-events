@@ -23,5 +23,18 @@
     "abort": {
       "already_configured": "This camera is already configured."
     }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Tapo ONVIF Events options",
+        "data": {
+          "flap_recovery": "Flap recovery (for a flaky camera)"
+        },
+        "data_description": {
+          "flap_recovery": "Enable only for a camera whose ONVIF connection repeatedly drops (endless 'Server disconnected' reconnects). Escalates the reconnect backoff, stops flooding the log, and marks the camera unavailable while the event feed is down instead of showing a false 'clear'. Leave OFF for healthy cameras."
+        }
+      }
+    }
   }
 }

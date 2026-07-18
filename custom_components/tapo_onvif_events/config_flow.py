@@ -7,9 +7,16 @@ from typing import Any
 
 import voluptuous as vol
 
-from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
+from homeassistant.config_entries import (
+    ConfigEntry,
+    ConfigFlow,
+    ConfigFlowResult,
+    OptionsFlow,
+)
+from homeassistant.core import callback
 
 from .const import (
+    CONF_FLAP_RECOVERY,
     CONF_HOST,
     CONF_PASSWORD,
     CONF_PORT,
@@ -35,6 +42,12 @@ class TapoOnvifConfigFlow(ConfigFlow, domain=DOMAIN):
     """Handle a config flow for Tapo ONVIF Events."""
 
     VERSION = 1
+
+    @staticmethod
+    @callback
+    def async_get_options_flow(config_entry: ConfigEntry) -> TapoOnvifOptionsFlow:
+        """Return the options flow (per-camera tunables)."""
+        return TapoOnvifOptionsFlow()
 
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
@@ -70,4 +83,25 @@ class TapoOnvifConfigFlow(ConfigFlow, domain=DOMAIN):
 
         return self.async_show_form(
             step_id="user", data_schema=STEP_USER_SCHEMA, errors=errors
+        )
+
+
+class TapoOnvifOptionsFlow(OptionsFlow):
+    """Per-camera options: opt-in flap recovery for a flaky camera."""
+
+    async def async_step_init(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Manage the options."""
+        if user_input is not None:
+            return self.async_create_entry(data=user_input)
+
+        current = self.config_entry.options.get(CONF_FLAP_RECOVERY, False)
+        return self.async_show_form(
+            step_id="init",
+            data_schema=vol.Schema(
+                {
+                    vol.Required(CONF_FLAP_RECOVERY, default=current): bool,
+                }
+            ),
         )

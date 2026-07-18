@@ -12,6 +12,7 @@ import asyncio
 import logging
 import time
 
+import aiohttp
 from onvif import ONVIFCamera
 
 from homeassistant.core import HomeAssistant
@@ -19,6 +20,11 @@ from homeassistant.helpers.dispatcher import async_dispatcher_send
 
 from .const import (
     FIELD_MAP,
+    FLAP_HEARTBEAT,
+    FLAP_OFFLINE_GRACE,
+    FLAP_PULL_RETRY_DELAY,
+    FLAP_RESUB_DELAY,
+    FLAP_THRESHOLD,
     KEYS,
     OFFLINE_GRACE,
     PP_NS,
@@ -33,6 +39,25 @@ from .const import (
 )
 
 _LOGGER = logging.getLogger(__name__)
+
+# A dropped/refused HTTP connection to the camera's event port. All of aiohttp's
+# ServerDisconnectedError / ClientConnectionResetError / ClientOSError subclass
+# ClientConnectionError; ConnectionError covers the bare-socket variants. A real
+# subscription fault (zeep Fault) is NOT one of these, so it still escalates to a
+# resubscribe instead of being retried in place.
+_TRANSIENT_PULL_ERRORS = (aiohttp.ClientConnectionError, ConnectionError)
+
+
+def _is_transient(err: BaseException) -> bool:
+    """True if err (or its cause/context chain) is a transport disconnect."""
+    seen = 0
+    current: BaseException | None = err
+    while current is not None and seen < 8:
+        if isinstance(current, _TRANSIENT_PULL_ERRORS):
+            return True
+        current = current.__cause__ or current.__context__
+        seen += 1
+    return False
 
 
 async def async_probe_camera(
@@ -71,6 +96,7 @@ class TapoOnvifClient:
         port: int,
         user: str,
         password: str,
+        flap_recovery: bool = False,
     ) -> None:
         """Initialise the client."""
         self.hass = hass
@@ -79,6 +105,8 @@ class TapoOnvifClient:
         self._port = port
         self._user = user
         self._password = password
+        # Opt-in flap recovery (see const.py). Off => original code path.
+        self._flap_recovery = flap_recovery
 
         # Baseline: every key OFF until the camera says otherwise.
         self.state: dict[str, bool] = {key: False for (_f, key, _dc, _l) in KEYS}
@@ -92,6 +120,102 @@ class TapoOnvifClient:
         self._diag_log: dict[str, float] = {}
         self.available = False
         self._stop = asyncio.Event()
+
+        # -- flap-recovery state (only used when self._flap_recovery) --------
+        # Monotonic time of the last PullMessages that actually completed (even
+        # empty). Drives honest availability: a flapping camera never completes
+        # a pull, so this ages out and we go unavailable instead of pretending
+        # a healthy "off". Seeded to now so a fresh start gets a grace window.
+        self._last_ok = time.monotonic()
+        # Monotonic time of the last (re)subscribe — gates the escalation from
+        # in-place pull retries to a subscription refresh, so a long zero-success
+        # stretch cannot permanently disable the rapid retry (which keys off
+        # _last_ok, and _last_ok only advances on a success).
+        self._last_resub = time.monotonic()
+        self._consecutive_fails = 0
+        self._flap_active = False
+        self._flap_since: float | None = None
+        self._flap_last_notice = 0.0
+
+    # -- flap recovery ---------------------------------------------------
+
+    def _note_pull_ok(self) -> None:
+        """Record a successful long-poll: clears flap state, restores availability.
+
+        Called after every PullMessages that completes (including empty idle
+        returns). A genuinely flapping camera never reaches here.
+        """
+        now = time.monotonic()
+        self._last_ok = now
+        self._consecutive_fails = 0
+        self._set_available(True)
+        if self._flap_active:
+            dur = now - (self._flap_since or now)
+            _LOGGER.warning(
+                "[%s] ONVIF flap cleared after %.0fs; event flow restored",
+                self._host,
+                dur,
+            )
+            self._flap_active = False
+            self._flap_since = None
+
+    def _account_flap(self, err: Exception, phase: str) -> None:
+        """Shared flap bookkeeping: counters, flap entry, heartbeat, availability.
+
+        Called both by the in-loop same-subscription retry (the primary fix) and
+        by the outer resubscribe path (rare escalation). After FLAP_THRESHOLD
+        consecutive failures we (1) log one summary WARNING + a periodic
+        heartbeat and drop per-retry noise to DEBUG, and (2) mark the camera
+        unavailable once no pull has completed for FLAP_OFFLINE_GRACE — surfacing
+        the outage instead of leaving every entity a deceptively healthy "off".
+        """
+        now = time.monotonic()
+        self._consecutive_fails += 1
+
+        if not self._flap_active and self._consecutive_fails >= FLAP_THRESHOLD:
+            self._flap_active = True
+            self._flap_since = now
+            self._flap_last_notice = now
+            _LOGGER.warning(
+                "[%s] ONVIF flap detected (%d consecutive pull failures); holding "
+                "the subscription and retrying pulls in place, suppressing "
+                "per-retry logs until it clears",
+                self._host,
+                self._consecutive_fails,
+            )
+
+        # Honest availability: no successful pull for a while => degraded.
+        if now - self._last_ok >= FLAP_OFFLINE_GRACE:
+            self._set_available(False)
+
+        if self._flap_active:
+            _LOGGER.debug("[%s] pull failed (%s): %r", self._host, phase, err)
+            if now - self._flap_last_notice >= FLAP_HEARTBEAT:
+                self._flap_last_notice = now
+                _LOGGER.warning(
+                    "[%s] ONVIF still flapping after %.0fs (%d fails, feed %s)",
+                    self._host,
+                    now - (self._flap_since or now),
+                    self._consecutive_fails,
+                    "unavailable" if not self.available else "degraded",
+                )
+        else:
+            _LOGGER.warning(
+                "[%s] pull failed (%s): %r; retrying", self._host, phase, err
+            )
+
+    def _handle_flap_error(self, err: Exception) -> float:
+        """Outer (resubscribe) escalation path; returns the reconnect delay.
+
+        Reached only when the in-loop retry escalates: a non-transient error, a
+        hard-timeout stall, or transient disconnects that persisted with no
+        successful pull for FLAP_OFFLINE_GRACE since the last (re)subscribe — the
+        subscription may be dead, so refresh it. A small fixed delay (not the
+        old exponential backoff) so we resume rapid pulling on the fresh
+        subscription quickly, while never hammering CreatePullPointSubscription.
+        """
+        self._account_flap(err, "resubscribe")
+        return FLAP_RESUB_DELAY
 
     # -- state fan-out ---------------------------------------------------
 
@@ -199,6 +323,10 @@ class TapoOnvifClient:
                 # Subscription manager (Renew / Unsubscribe) + pull service.
                 sub_mgr = await cam.create_subscription_service("PullPointSubscription")
                 pullpoint = await cam.create_pullpoint_service()
+                # Stamp the (re)subscribe so the in-loop retry gets a fresh
+                # FLAP_OFFLINE_GRACE window on this new subscription before it may
+                # escalate to another refresh (see the transient-pull handler).
+                self._last_resub = time.monotonic()
                 # Re-baseline on every (re)subscribe. The camera keeps no state
                 # across a reconnect or its scheduled reboot, so any "on" we are
                 # still holding is stale. Clear it BEFORE marking available, so
@@ -208,7 +336,12 @@ class TapoOnvifClient:
                 # camera's next event.
                 for _field, _key, _dc, _label in KEYS:
                     self._set_key(_key, False)
-                self._set_available(True)
+                # In flap mode, availability follows an actually-completed pull
+                # (see _note_pull_ok), not the mere fact that a subscribe
+                # succeeded — a flapping camera subscribes fine, then drops the
+                # connection before the first PullMessages ever returns.
+                if not self._flap_recovery:
+                    self._set_available(True)
                 fail_since = None
                 _LOGGER.info("[%s] subscribed %s", self._host, cam.xaddrs[PP_NS])
                 next_renew = time.monotonic() + RENEW_SECONDS
@@ -242,6 +375,47 @@ class TapoOnvifClient:
                             f"{', '.join(on_keys) if on_keys else 'none'}); "
                             "forcing reconnect"
                         ) from err
+                    except Exception as err:  # noqa: BLE001
+                        # FLAP RECOVERY (primary fix). A dropped/refused pull
+                        # connection does NOT invalidate the PullPoint
+                        # subscription — proven by live probe: one held
+                        # subscription kept delivering queued events across a
+                        # ~60% connection-drop rate, never resubscribing. So on a
+                        # transient transport disconnect we retry the pull on the
+                        # SAME subscription instead of falling through to the outer
+                        # teardown+resubscribe, which discards the camera's queued
+                        # events (Unsubscribe) and re-baselines — the actual cause
+                        # of the multi-hour blackouts. Only a NON-transient error
+                        # escalates immediately. Disabled (option off) => behaves
+                        # exactly as before.
+                        if not (self._flap_recovery and _is_transient(err)):
+                            raise
+                        self._account_flap(err, "same-sub retry")
+                        # Escalate to a subscription REFRESH only if this
+                        # subscription has produced no successful pull for
+                        # FLAP_OFFLINE_GRACE *and* it has itself been alive that
+                        # long (keyed off _last_resub, not _last_ok — otherwise a
+                        # sustained zero-success stretch would pin _last_ok in the
+                        # past and permanently collapse the rapid retry into one
+                        # attempt per resubscribe). Between refreshes we keep
+                        # retrying the pull in place at FLAP_PULL_RETRY_DELAY.
+                        now = time.monotonic()
+                        if (
+                            now - self._last_ok >= FLAP_OFFLINE_GRACE
+                            and now - self._last_resub >= FLAP_OFFLINE_GRACE
+                        ):
+                            raise
+                        try:
+                            await asyncio.wait_for(
+                                self._stop.wait(), timeout=FLAP_PULL_RETRY_DELAY
+                            )
+                        except asyncio.TimeoutError:
+                            pass
+                        continue
+                    # A completed pull (even empty) means the camera is talking:
+                    # clear any flap state and refresh honest availability.
+                    if self._flap_recovery:
+                        self._note_pull_ok()
                     messages = getattr(resp, "NotificationMessage", None) or []
                     _LOGGER.debug(
                         "[%s] PullMessages returned after %.1fs with %d message(s)",
@@ -263,19 +437,25 @@ class TapoOnvifClient:
                 await self._teardown(cam, sub_mgr)
                 raise
             except Exception as err:  # noqa: BLE001 - reconnect on any ONVIF error
-                if fail_since is None:
-                    fail_since = time.monotonic()
-                if time.monotonic() - fail_since >= OFFLINE_GRACE:
-                    self._set_available(False)
-                _LOGGER.warning(
-                    "[%s] loop error: %r; retry in %ss",
-                    self._host,
-                    err,
-                    RETRY_SECONDS,
-                )
                 await self._teardown(cam, sub_mgr)
+                if self._flap_recovery:
+                    # Escalating backoff + honest availability + log de-flood.
+                    retry = self._handle_flap_error(err)
+                else:
+                    # --- original behaviour (unchanged for healthy cameras) ---
+                    if fail_since is None:
+                        fail_since = time.monotonic()
+                    if time.monotonic() - fail_since >= OFFLINE_GRACE:
+                        self._set_available(False)
+                    _LOGGER.warning(
+                        "[%s] loop error: %r; retry in %ss",
+                        self._host,
+                        err,
+                        RETRY_SECONDS,
+                    )
+                    retry = RETRY_SECONDS
                 try:
-                    await asyncio.wait_for(self._stop.wait(), timeout=RETRY_SECONDS)
+                    await asyncio.wait_for(self._stop.wait(), timeout=retry)
                 except asyncio.TimeoutError:
                     pass
 

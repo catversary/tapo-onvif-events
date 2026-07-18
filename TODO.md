@@ -4,6 +4,46 @@ Pending work for **tapo-onvif-events**. Contributions welcome.
 
 ## Investigation — pending recurrence
 
+- [x] **Flap recovery for a chronically flaky camera — opt-in `flap_recovery` option (v0.3.0).**
+  Some Tapo firmware (observed on a C325WB after a firmware update; a C575D on the same
+  integration is unaffected) drives the ONVIF event endpoint into a *flapping* state: it
+  creates the PullPoint subscription fine, but then drops a large fraction (~60% observed)
+  of individual `PullMessages` connections with an instant `ServerDisconnectedError` — the
+  TCP socket is accepted, then closed at the HTTP layer. Left unhandled this produced
+  multi-hour silent event gaps.
+
+  **The root cause of those gaps was on our side, not just the camera.** A live sole-client
+  probe proved the PullPoint *subscription survives the disconnects*: one held subscription,
+  never resubscribed, kept delivering the camera's queued events for 180s straight at
+  ~31–44% pull success. The old loop tore the subscription down and re-subscribed on *every*
+  error — the `Unsubscribe` discarded the events the camera had queued, and the fresh
+  subscribe re-baselined state. During a bad stretch (roughly one attempt every few seconds
+  at ~30% odds, each on a brand-new subscription) that silently dropped detections for
+  minutes to hours. (Keep-alive was ruled out as the cause: forcing `Connection: close`
+  scored *worse* — cold connections are dropped more — so the library's default keepalive
+  is kept.)
+
+  **Fix — opt-in, per-entry `flap_recovery` option (options flow, default OFF, so a healthy
+  camera's code path is byte-for-byte unchanged):**
+  - On a transient pull disconnect (`aiohttp.ClientConnectionError` / `ConnectionError`),
+    retry `PullMessages` on the **same subscription** every `FLAP_PULL_RETRY_DELAY` (0.25s,
+    ~4/s) instead of tearing it down — so the camera re-delivers its queued events on
+    whichever connection survives. Turns a near-total blackout into events captured within
+    ~1–2s even at a ~60% drop rate.
+  - Escalate to a subscription **refresh** (teardown + fresh subscribe) only on a
+    non-transient error, a hard-timeout stall, or no successful pull for
+    `FLAP_OFFLINE_GRACE` (120s) *since the last (re)subscribe* — gated on the resubscribe
+    time, not the last-success time, so a sustained zero-success stretch can't permanently
+    collapse the rapid retry into one attempt per refresh.
+  - Honest availability: the camera goes `unavailable` once no pull has completed for the
+    grace window, instead of every entity reading a deceptive "off".
+  - Log de-flood: one WARNING when a flap is detected + a `FLAP_HEARTBEAT` (300s) heartbeat;
+    per-retry disconnects drop to DEBUG.
+
+  Enable only on an affected camera's entry; leave OFF for healthy cameras. Also positively
+  captured, during the probe, the long-suspected **`IsMotion` continuous-assert flood** (the
+  camera streams `IsMotion=true` back-to-back) — see the flood item below; dedup absorbs it.
+
 - [ ] **Suspected `IsMotion` "continuous-assert" flood (unconfirmed; max-on
       ceiling deferred until captured).**
   Observed once (2026-07-12): the `motion` sensor latched `on` for ~2h43m after
